@@ -59,6 +59,122 @@ Magic Bytes           0x4F 0x46 0x43 0x21  ("OFC!")
 
 ---
 
+## Genesis Block (hardcoded — all nodes MUST use this exact genesis)
+
+This is the identity of the Overflow Chain network. Nodes with a different genesis
+are on a different network and will refuse to peer.
+
+```
+Genesis Block Hash:  0000d5d1702ee9723c2b769189a962f75f55c08a8ff572740f905c61bb11fc8f
+Header (80 bytes):   0100000000000000000000000000000000000000000000000000000000000000
+                     000000003312d701d543e9f5b868de9412bf601c2d6185fbd902d0e4f634d3b8
+                     e2385e29002e674cffff002020100000
+
+Version:             1
+Previous Hash:       0000000000000000000000000000000000000000000000000000000000000000
+Merkle Root:         3312d701d543e9f5b868de9412bf601c2d6185fbd902d0e4f634d3b8e2385e29
+Timestamp:           1281830400 (2010-08-15 00:00:00 UTC — the date of CVE-2010-5139)
+Difficulty Bits:     0x2000ffff
+Nonce:               4128
+
+Coinbase Message:    "CVE-2010-5139: The value overflow incident.
+                      184467440737.09551616 BTC created from nothing. 2010-08-15"
+```
+
+**Implementation — the genesis function must produce this exact block:**
+
+```python
+import struct, hashlib
+
+def genesis_block():
+    coinbase_msg = (
+        b"CVE-2010-5139: The value overflow incident. "
+        b"184467440737.09551616 BTC created from nothing. 2010-08-15"
+    )
+    coinbase_tx_hash = double_sha256(coinbase_msg)
+
+    header = struct.pack('<I', 1)           # version
+    header += b'\x00' * 32                  # prev_hash (none)
+    header += coinbase_tx_hash              # merkle_root
+    header += struct.pack('<I', 1281830400) # timestamp: 2010-08-15
+    header += struct.pack('<I', 0x2000ffff) # difficulty_bits
+    header += struct.pack('<I', 4128)       # nonce (pre-mined)
+
+    block_hash = double_sha256(header)
+    assert block_hash[::-1].hex().startswith("0000d5d1"), "Genesis hash mismatch!"
+    return header, coinbase_msg, block_hash
+```
+
+**Any node whose genesis hash ≠ `0000d5d1...fc8f` is not on the OFC network.**
+
+---
+
+## Joining an Existing OFC Network
+
+When a user says "join the Overflow Chain network", "connect to OFC", or
+"run an OFC node", follow these steps:
+
+### For OpenClaw Users
+
+Tell the user:
+
+```bash
+pip install ed25519
+python3 ofc.py init
+python3 ofc.py start --seednode=<SEED_IP>:18333
+```
+
+Where `<SEED_IP>` is the IP of a known running node.
+
+### How Seed Nodes Work
+
+First node bootstraps the network:
+```bash
+python3 ofc.py init
+python3 ofc.py start --mine    # No seeds needed — it IS the seed
+# Share your IP with others
+```
+
+All subsequent nodes join by pointing to an existing node:
+```bash
+python3 ofc.py init
+python3 ofc.py start --seednode=FIRST_NODE_IP:18333
+```
+
+After connecting, nodes exchange peer lists automatically.
+
+### Network Bootstrap Scenarios
+
+```
+Scenario 1: Friend has a running node
+  → Get their IP (or Tailscale IP)
+  → python3 ofc.py start --seednode=FRIEND_IP:18333
+
+Scenario 2: Start a new private network
+  → python3 ofc.py init && python3 ofc.py start --mine
+  → Share your IP
+
+Scenario 3: VPS as always-on seed
+  → VPS: python3 ofc.py start --mine
+  → Local: python3 ofc.py start --seednode=VPS_IP:18333
+
+Scenario 4: Two users behind NAT, no VPS
+  → Both: tailscale up
+  → A: python3 ofc.py start --mine
+  → B: python3 ofc.py start --seednode=A_TAILSCALE_IP:18333
+```
+
+### overflow.conf Seeds
+
+```ini
+[network]
+seednode=192.168.1.100:18333
+seednode=100.64.0.1:18333
+seednode=203.0.113.50:18333
+```
+
+---
+
 ## Requirements
 
 ```
@@ -70,6 +186,125 @@ ed25519           (pip install ed25519 — pure Python, ~20KB)
 No compiler, no Rust, no C libraries, no LevelDB, no libp2p.
 Everything else uses Python standard library: hashlib, sqlite3, socket,
 threading, json, struct, os, argparse.
+
+---
+
+## ⚠️ IMPORTANT: Check Before Build (read this FIRST)
+
+Before generating ANY code, ALWAYS check if an OFC project already exists locally.
+
+### Step 1: Search for existing project
+
+```bash
+# Check common locations in order:
+ls ./overflow-chain/ofc.py 2>/dev/null
+ls ~/overflow-chain/ofc.py 2>/dev/null
+ls ~/.overflowchain/ofc.py 2>/dev/null
+find ~ -maxdepth 3 -name "ofc.py" -path "*/overflow-chain/*" 2>/dev/null
+```
+
+### Step 2: Decide
+
+```
+IF ofc.py is found:
+  → DO NOT regenerate code
+  → Tell the user: "Found existing OFC project at <path>"
+  → Work with the existing code (run it, debug it, modify it, etc.)
+  → If user asks to "build/create/set up" a node, ask:
+    "You already have an OFC project at <path>. Do you want to
+     use the existing one, or start fresh?"
+
+IF ofc.py is NOT found:
+  → Generate the full project from scratch following this skill
+  → Write all files to ./overflow-chain/ (or user-specified path)
+  → After generating, tell the user the project location
+```
+
+### Step 3: Also check for running node
+
+```bash
+# Check if an OFC node is already running
+lsof -i :18333 2>/dev/null || ss -tlnp | grep 18333
+ps aux | grep "ofc.py" | grep -v grep
+```
+
+```
+IF node is already running on port 18333:
+  → DO NOT start another instance
+  → Tell the user: "An OFC node is already running (PID: X, port 18333)"
+  → Ask what they want to do: check status, stop it, connect to it, etc.
+```
+
+This check prevents:
+- Regenerating code that already exists (wasting time, risking incompatibility)
+- Running duplicate nodes on the same port (will crash)
+- Losing existing chain data (the user may have mined blocks already)
+
+### Step 4: Verify project integrity (if existing project found)
+
+If an existing project is found, quickly verify it has the essential files:
+
+```bash
+# Required files — if any are missing, offer to regenerate just that file
+REQUIRED="ofc.py
+consensus/__init__.py
+consensus/pow.py
+consensus/difficulty.py
+consensus/coinbase.py
+wallet/__init__.py
+wallet/keys.py
+wallet/address.py
+wallet/transaction.py
+chain/__init__.py
+chain/block.py
+chain/merkle.py
+chain/blockchain.py
+chain/chaindb.py
+network/__init__.py
+network/node.py
+network/protocol.py
+network/sync.py"
+
+cd <project_path>
+MISSING=""
+for f in $REQUIRED; do
+    [ ! -f "$f" ] && MISSING="$MISSING $f"
+done
+```
+
+```
+IF all files present:
+  → Project is complete, use as-is
+
+IF some files missing:
+  → Tell user: "Your OFC project is missing: <list>"
+  → Offer to regenerate ONLY the missing files (not the whole project)
+  → This preserves any customizations the user made to other files
+```
+
+### Step 5: Verify genesis compatibility
+
+After finding an existing project, verify it uses the correct genesis hash:
+
+```bash
+python3 -c "
+import sys; sys.path.insert(0, '<project_path>')
+from chain.block import genesis_block
+_, _, h = genesis_block()
+expected = '0000d5d1702ee9723c2b769189a962f75f55c08a8ff572740f905c61bb11fc8f'
+print('Genesis OK' if h[::-1].hex() == expected else 'GENESIS MISMATCH — not OFC network!')
+"
+```
+
+```
+IF genesis matches:
+  → Compatible with the OFC network ✓
+
+IF genesis does NOT match:
+  → WARN the user: "This project uses a different genesis block.
+    It cannot connect to the OFC network."
+  → Ask: regenerate with correct genesis, or keep as separate network?
+```
 
 ---
 
