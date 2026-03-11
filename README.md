@@ -1,22 +1,31 @@
-# ⛓ Overflow Chain (OFC)
+# ⛓ Overflow Chain (OFC) — Lightweight Edition
 
 **From a bug, a chain is born.**
 
-On August 15, 2010, Bitcoin block 74638 contained a transaction that created **184,467,440,737.09551616 BTC** out of thin air — exploiting an integer overflow in the output sum check ([CVE-2010-5139](https://en.bitcoin.it/wiki/CVE-2010-5139)). Satoshi patched it within five hours and the chain forked back to sanity. That number — exactly **2⁶⁴ satoshis** — was erased from Bitcoin's history.
+On August 15, 2010, Bitcoin block 74638 created **184,467,440,737.09551616 BTC** out of thin air via an integer overflow ([CVE-2010-5139](https://en.bitcoin.it/wiki/CVE-2010-5139)). Overflow Chain immortalizes that number as its total supply.
 
-Overflow Chain brings it back. Our total supply is that exact number: **184,467,440,737.09551616 OFC**. What was a bug becomes a feature.
+## Why Lightweight?
 
----
+The original v1 required Rust compilation (2GB+ RAM), libp2p (~200 crates), and LevelDB (C++ native). Many users on low-end VPS or Raspberry Pi couldn't run it.
 
-## What is this?
+This v2 Lite edition delivers **identical blockchain functionality** with radically simpler dependencies:
 
-This is an **OpenClaw / Claude skill** that teaches an AI agent to build, run, and deploy a fully functional Overflow Chain node — including:
+| | v1 (Rust + libp2p) | **v2 Lite (Python)** |
+|---|---|---|
+| Compile RAM | 2+ GB | **0 (interpreted)** |
+| Runtime RAM | ~200 MB | **~30-50 MB** |
+| External deps | ~200 crates | **1 pip package** |
+| Install time | 10+ minutes | **5 seconds** |
+| Min hardware | 2 CPU, 2GB RAM | **1 CPU, 512MB RAM** |
 
-- ⛏ **SHA-256 double-hash Proof of Work** (same algorithm as Bitcoin)
-- 🔑 **Ed25519 wallets** with encrypted storage
-- 🌳 **Merkle tree** transaction verification
-- 🌐 **libp2p P2P networking** (GossipSub, Kademlia DHT, NAT traversal)
-- 📦 **Bitcoin-style storage** (blk*.dat files, LevelDB indexes)
+## Requirements
+
+```bash
+python3 --version   # 3.8 or higher
+pip install ed25519  # only external dependency (~20KB, pure Python)
+```
+
+That's it. No compiler, no C libraries, no Rust, no Node.js.
 
 ## Chain Parameters
 
@@ -24,95 +33,73 @@ This is an **OpenClaw / Claude skill** that teaches an AI agent to build, run, a
 |---|---|
 | **Ticker** | OFC |
 | **Total Supply** | 184,467,440,737.09551616 OFC (≈ 2⁶⁴ smallest units) |
-| **Smallest Unit** | 10⁻⁸ OFC (called "bit") |
 | **Initial Block Reward** | 439,208.19223131 OFC |
 | **Halving Interval** | 210,000 blocks |
 | **Block Time** | 10 minutes |
-| **Difficulty Adjustment** | Every 2,016 blocks |
 | **Consensus** | SHA-256² Proof of Work |
 | **Signatures** | Ed25519 |
-| **P2P** | libp2p (TCP + Noise + Yamux + GossipSub) |
+| **P2P** | TCP + JSON-line (TLS optional) |
+| **Storage** | SQLite (single file, stdlib) |
 | **Default Port** | 18333 |
-| **Namesake** | [CVE-2010-5139](https://nvd.nist.gov/vuln/detail/CVE-2010-5139) |
 
-## Install
+## Quick Start
 
-### For OpenClaw users
+```bash
+git clone https://github.com/zhangjiayix2nt/overflow-chain.git
+cd overflow-chain
+pip install ed25519
 
-Paste this repo URL directly into your OpenClaw chat:
+python3 ofc.py init                    # Create ~/.overflowchain/ + genesis block
+python3 ofc.py start                   # Start node, connect to network
+python3 ofc.py start --mine            # Start mining
+python3 ofc.py wallet create           # Create a wallet
+python3 ofc.py send ofc1... 100        # Send 100 OFC
+```
+
+## Install as OpenClaw Skill
+
+Paste this URL into your OpenClaw chat:
 
 ```
-https://github.com/YOUR_USERNAME/overflow-chain
+https://github.com/zhangjiayix2nt/overflow-chain
 ```
-
-OpenClaw will automatically detect the SKILL.md and install it.
 
 Or manually:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/overflow-chain.git
+git clone https://github.com/zhangjiayix2nt/overflow-chain.git
 cp -r overflow-chain ~/.openclaw/skills/
 ```
 
-Then start a new OpenClaw session.
+## What Changed from v1
 
-### For Claude users
+| Component | v1 | v2 Lite |
+|---|---|---|
+| Language | Rust | Python 3.8+ |
+| P2P | libp2p (GossipSub, Kademlia, Noise, Yamux, Relay, DCUtR) | Raw TCP + JSON lines + flood gossip (+ optional TLS) |
+| Storage | blk*.dat + LevelDB block index + LevelDB chainstate | Single SQLite file (`chain.db`) |
+| Wallet crypto | scrypt (16MB RAM per call) | PBKDF2-SHA256 (stdlib, <1MB) |
+| Peer discovery | mDNS + Kademlia DHT + DNS seeds | Seed nodes + peer exchange |
+| NAT traversal | Circuit Relay + DCUtR hole punching | Port forward / Tailscale / SSH tunnel |
 
-Download the `.skill` file from [Releases](https://github.com/YOUR_USERNAME/overflow-chain/releases) and upload it in Claude's skill settings.
-
-### Via ClawHub
-
-```bash
-clawhub install overflow-chain
-```
-
-## Usage
-
-After installing, just tell your AI agent:
-
-- *"Build me an Overflow Chain node"*
-- *"Mine some OFC"*
-- *"Create an OFC wallet and send 100 OFC to ofc1..."*
-- *"Set up a 3-node OFC testnet"*
-- *"Connect my OFC node to my friend's node across the internet"*
-
-The skill handles language selection (Rust/Python/TypeScript), project scaffolding, and all implementation details.
+**All chain rules are identical**: same PoW algorithm, same halving curve, same total supply, same block format. A v1 and v2 node speaking the same wire protocol can interoperate.
 
 ## File Structure
 
 ```
 overflow-chain/
-├── SKILL.md                    ← Main skill file (AI reads this)
+├── SKILL.md                 ← AI skill definition
 ├── references/
-│   ├── pow_consensus.md        ← Mining algorithm, difficulty, halving schedule
-│   ├── p2p_network.md          ← libp2p setup, NAT traversal, chain sync
-│   └── explorer_ui.md          ← Block explorer REST API & UI templates
-├── .github/
-│   └── workflows/
-│       └── publish.yml         ← Auto-publish to ClawHub on release
+│   ├── pow_consensus.md     ← Mining, difficulty, halving
+│   ├── p2p_network.md       ← TCP protocol, sync, gossip
+│   └── explorer_ui.md       ← Block explorer API & UI
 ├── LICENSE
 └── README.md
 ```
 
-## Halving Schedule
-
-The reward curve is geometrically identical to Bitcoin's:
-
-| Phase | Blocks | Reward / Block | Phase Total |
-|-------|--------|----------------|-------------|
-| 0 | 0 – 209,999 | 439,208.19 OFC | 92.2B OFC |
-| 1 | 210,000 – 419,999 | 219,604.10 OFC | 46.1B OFC |
-| 2 | 420,000 – 629,999 | 109,802.05 OFC | 23.1B OFC |
-| 3 | 630,000 – 839,999 | 54,901.02 OFC | 11.5B OFC |
-| ... | ... | halves each phase | ... |
-| 45 | 9,450,000 – 9,659,999 | 0.00000001 OFC | 0.002 OFC |
-| 46+ | 9,660,000+ | 0 (fees only) | — |
-
-**Total mined: ≈ 184,467,440,737.09 OFC**
-
 ## Contributing
 
-Issues and PRs welcome. If you're extending the skill (new consensus module, UTXO model, smart contracts), please keep the SKILL.md under 500 lines and put details in `references/`.
+PRs welcome. Keep external dependencies to zero if possible (stdlib only). The ed25519 package is the one exception.
 
 ## License
 
