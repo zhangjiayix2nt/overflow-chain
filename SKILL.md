@@ -2,7 +2,7 @@
 name: overflow-chain
 description: Build and run Overflow Chain (OFC) nodes — a Bitcoin-inspired blockchain whose total supply of 184,467,440,737.09551616 OFC (exactly 2^64 smallest units) is a homage to CVE-2010-5139. Uses SHA-256 double-hash PoW, Ed25519 wallets, Merkle trees, and TCP P2P networking. Lightweight pure-Python implementation runs on machines with as little as 1GB RAM and 1 CPU. Use when the user mentions OFC, Overflow Coin, overflow chain, proof of work, mining, blockchain node, crypto wallet, P2P network, block explorer, or wants to build, run, join, or mine on a blockchain. Also trigger for general blockchain prototype requests.
 version: 2.0.0
-metadata: {"openclaw":{"emoji":"⛓","homepage":"https://github.com/zhangjiayix2nt/overflow-chain","requires":{"bins":["python3"]}}}
+metadata: {"openclaw":{"emoji":"⛓","homepage":"https://github.com/overflow-chain","requires":{"bins":["python3"]}}}
 ---
 
 # Overflow Chain (OFC) — Lightweight Edition
@@ -534,116 +534,113 @@ class ChainDB:
 
 ## Module 4: P2P Network (Pure TCP)
 
-Read `{baseDir}/references/p2p_network.md` for full details.
+Read `{baseDir}/references/p2p_network.md` for complete protocol specification,
+full handshake code, and detailed troubleshooting guide.
 
-### Protocol: JSON Lines over TCP
+### Connection Protocol (strict order — every step must pass)
 
 ```
-Each message = one JSON object + newline (\n)
-Connection encrypted with: TLS (ssl stdlib module) or plaintext for local testing
+1. TCP connect
+2. Both sides send 4-byte magic: 0x4F464321 ("OFC!")
+   → If wrong magic received → close (not an OFC node)
+3. Both sides send version JSON (includes genesis_hash)
+   → If genesis_hash mismatches → send reject + close (different network)
+4. Both sides send verack
+5. Connection established — now accept all message types
 ```
+
+Every failure MUST be logged with the specific step and reason.
+
+### Magic Bytes — First Line of Defense
 
 ```python
-import socket, ssl, json, threading
-
-class PeerConnection:
-    def __init__(self, sock):
-        self.sock = sock
-        self.reader = sock.makefile('r')
-        self.writer = sock.makefile('w')
-
-    def send(self, msg_type: str, payload: dict):
-        msg = json.dumps({"type": msg_type, "data": payload}) + "\n"
-        self.writer.write(msg)
-        self.writer.flush()
-
-    def recv(self) -> dict:
-        line = self.reader.readline()
-        if not line:
-            raise ConnectionError("peer disconnected")
-        return json.loads(line)
+MAGIC = b'\x4f\x46\x43\x21'  # "OFC!" — first 4 raw bytes of every connection
 ```
 
-### Message Types (same semantics as v1, simpler encoding)
+Send immediately after TCP connect. If first 4 received bytes ≠ `4F464321`,
+close at once. This rejects HTTP bots, SSH scanners, and non-OFC nodes
+within milliseconds before wasting any further resources.
+
+### Version Message — Network Identity
 
 ```python
-# Handshake
-{"type": "version", "data": {"protocol": 1, "height": 142, "agent": "ofc-py/2.0"}}
-{"type": "verack",  "data": {}}
-
-# Block propagation
-{"type": "new_block", "data": {"block": "<hex-encoded block>"}}
-{"type": "get_block", "data": {"hash": "<hex>"}}
-{"type": "block",     "data": {"block": "<hex>"}}
-
-# Transactions
-{"type": "new_tx", "data": {"tx": "<hex>"}}
-
-# Chain sync
-{"type": "get_headers", "data": {"from_height": 0, "count": 500}}
-{"type": "headers",     "data": {"headers": ["<hex>", ...]}}
-{"type": "get_blocks",  "data": {"hashes": ["<hex>", ...]}}
-
-# Peer discovery
-{"type": "get_peers", "data": {}}
-{"type": "peers",     "data": {"peers": [{"host": "1.2.3.4", "port": 18333}]}}
+{"type": "version", "data": {
+    "protocol": 1,
+    "agent": "ofc-py/2.0.0",
+    "height": 42,
+    "genesis_hash": "0000d5d1702ee9723c2b769189a962f75f55c08a8ff572740f905c61bb11fc8f",
+    "port": 18333,
+    "timestamp": 1710000000,
+    "nonce": 847162539
+}}
 ```
 
-### Node Server
+**genesis_hash is mandatory.** If two nodes have different genesis hashes, they
+are on different networks and MUST NOT connect. Send a `reject` message with
+code `genesis_mismatch` before closing so the peer gets a clear error.
+
+### Reject Message (send before disconnecting on errors)
 
 ```python
-class Node:
-    def __init__(self, host='0.0.0.0', port=18333):
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((host, port))
-        self.server.listen(20)  # 20 max connections (low-memory friendly)
-        self.peers = {}         # peer_id -> PeerConnection
-        self.chain = ChainDB()
-        self.mempool = []
-
-    def start(self):
-        threading.Thread(target=self._accept_loop, daemon=True).start()
-        # Connect to seed nodes from config
-        for seed in self.config.get('seednodes', []):
-            self._connect_to(seed)
-
-    def _accept_loop(self):
-        while True:
-            sock, addr = self.server.accept()
-            threading.Thread(target=self._handle_peer, args=(sock, addr), daemon=True).start()
+{"type": "reject", "data": {
+    "code": "genesis_mismatch",    # machine-readable
+    "reason": "peer=abcd... ours=0000d5d1..."  # human-readable
+}}
+# Codes: genesis_mismatch, bad_magic, protocol_unsupported,
+#        clock_skew, self_connect, banned, too_many_peers
 ```
 
-### Gossip (simplified GossipSub)
+### Required Diagnostic CLI Commands
 
-```python
-def broadcast_block(self, block):
-    """Flood to all connected peers (simple but effective for small networks)."""
-    msg = {"type": "new_block", "data": {"block": block.to_hex()}}
-    seen = set()
-    for peer_id, conn in self.peers.items():
-        if peer_id not in seen:
-            conn.send(msg["type"], msg["data"])
-            seen.add(peer_id)
+The generated code MUST include these:
+
+```
+python3 ofc.py diagnose <ip> [--port 18333]
+    Step-by-step check: DNS → TCP → Magic → Version → Genesis → Verack → Status
+    Pinpoints exactly which step fails with specific fix suggestions
+
+python3 ofc.py netcheck
+    Local health: Python version, ed25519, port 18333, firewall, external IP
+
+python3 ofc.py peers list
+    Connected peers: height, agent, score, uptime
 ```
 
-For small networks (<100 nodes), simple flood is sufficient and uses zero
-extra memory compared to GossipSub's mesh state tracking.
+### Quick Troubleshooting Reference
+
+```
+"Connection refused"    → Node not running, or bound to 127.0.0.1 not 0.0.0.0
+"Connection timed out"  → Firewall / NAT / cloud security group blocking 18333
+"Bad magic bytes"       → Not an OFC node, or code version mismatch
+"Genesis mismatch"      → Different genesis — #1 cause of multi-node failures
+                          Both sides must have genesis hash 0000d5d1...
+"No version response"   → Peer crashed, or JSON line format mismatch
+"Clock skew"            → sudo timedatectl set-ntp true
+"Address already in use" → Old node still running: lsof -i :18333
+```
+
+See `{baseDir}/references/p2p_network.md` for full diagnostic code and fixes.
 
 ### NAT / WAN
 
-Same options as v1:
-- Port forwarding (simplest)
-- Tailscale/WireGuard VPN (zero-config for NAT-to-NAT)
-- No relay needed — TCP direct connection works through VPN
+- **Port forwarding**: router forward 18333 → local IP
+- **Tailscale**: `tailscale up` on both machines, use 100.x.x.x IPs
+- **SSH tunnel**: `ssh -L 18333:localhost:18333 user@remote`
 
-TLS encryption (optional, recommended for WAN):
-```python
-import ssl
-context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-context.load_cert_chain('node.crt', 'node.key')
-secure_sock = context.wrap_socket(sock, server_side=True)
-```
+### Checklist
+
+- [ ] 4-byte magic exchange (0x4F464321) as first bytes after TCP connect
+- [ ] Version message with genesis_hash field (mandatory)
+- [ ] Genesis hash validation — reject + disconnect on mismatch
+- [ ] Reject message with error code before every error-disconnect
+- [ ] Structured logging for every connection event ([MAGIC], [VERSION], etc.)
+- [ ] `diagnose` command — step-by-step remote connectivity check
+- [ ] `netcheck` command — local environment verification
+- [ ] Flood gossip with dedup (seen_blocks / seen_txs)
+- [ ] Headers-first IBD
+- [ ] Peer scoring + banning
+- [ ] `peers.json` persistence
+- [ ] Ping/pong keepalive every 60s
 
 ---
 
@@ -683,6 +680,8 @@ python3 ofc.py balance [address]           # Check balance
 python3 ofc.py getblock <hash|height>      # Block details
 python3 ofc.py getinfo                     # Status, height, peers
 python3 ofc.py peers list|add|ban          # Peer management
+python3 ofc.py diagnose <ip> [--port N]    # Step-by-step P2P connectivity test
+python3 ofc.py netcheck                    # Local environment health check
 ```
 
 ---
@@ -732,8 +731,227 @@ overflow-chain/
 4. **Wallet** — Keys, PBKDF2 encryption, transactions
 5. **Consensus** — Mining loop, difficulty, coinbase halving
 6. **Network** — TCP server, JSON-line protocol, peer management, IBD
-7. **CLI** — argparse commands
-8. **Explorer** (optional) — http.server stdlib RPC
+7. **CLI** — argparse commands, INCLUDING `diagnose` and `netcheck`
+8. **Self-Test** — Run the verification below BEFORE presenting to user
+9. **Explorer** (optional) — http.server stdlib RPC
+
+---
+
+## ⚠️ Post-Generation Self-Test (MANDATORY)
+
+After generating all code files, run these checks BEFORE telling the user
+the project is ready. If any check fails, fix the code and re-test.
+
+### Test 1: Genesis Block Integrity
+
+```bash
+cd <project_path>
+python3 -c "
+from chain.block import genesis_block, double_sha256
+header, coinbase_msg, block_hash = genesis_block()
+
+# Verify hash
+expected = '0000d5d1702ee9723c2b769189a962f75f55c08a8ff572740f905c61bb11fc8f'
+actual = block_hash[::-1].hex()
+assert actual == expected, f'GENESIS FAIL: {actual} != {expected}'
+
+# Verify header is 80 bytes
+assert len(header) == 80, f'HEADER SIZE FAIL: {len(header)} != 80'
+
+# Verify coinbase message
+assert b'CVE-2010-5139' in coinbase_msg, 'COINBASE MSG FAIL'
+
+print('✓ Genesis block OK')
+"
+```
+
+### Test 2: Block Reward Halving
+
+```bash
+python3 -c "
+from consensus.coinbase import block_reward
+
+# Check specific values
+assert block_reward(0) == 43_920_819_223_131, 'Block 0 reward wrong'
+assert block_reward(209_999) == 43_920_819_223_131, 'Block 209999 reward wrong'
+assert block_reward(210_000) == 21_960_409_611_565, 'Block 210000 reward wrong'
+assert block_reward(9_660_000) == 0, 'Block 9660000 should be 0'
+
+# Check total supply
+total = 0
+for i in range(46):
+    r = block_reward(i * 210_000)
+    total += r * 210_000
+assert abs(total - 18_446_744_073_709_140_015) < 210_000, f'Total supply wrong: {total}'
+
+print('✓ Halving schedule OK')
+"
+```
+
+### Test 3: Wallet Signing Round-Trip
+
+```bash
+python3 -c "
+from wallet.keys import generate_keypair
+from wallet.transaction import serialize_tx, sign_tx, verify_tx
+import hashlib
+
+sk, vk = generate_keypair()
+tx = {
+    'version': 1,
+    'sender': hashlib.sha256(vk.to_bytes()).digest()[:20],
+    'recipient': b'\\x00' * 20,
+    'amount': 100,
+    'fee': 1,
+    'nonce': 0,
+    'timestamp': 1710000000,
+    'payload': b'',
+}
+signed = sign_tx(tx, sk)
+assert verify_tx(signed, vk), 'SIGNATURE VERIFICATION FAIL'
+
+print('✓ Wallet sign/verify OK')
+"
+```
+
+### Test 4: Merkle Tree
+
+```bash
+python3 -c "
+from chain.merkle import MerkleTree
+import hashlib
+
+def sha256(d): return hashlib.sha256(d).digest()
+
+# 4 transactions
+hashes = [sha256(f'tx{i}'.encode()) for i in range(4)]
+tree = MerkleTree(hashes)
+
+# Proof for tx2
+proof = tree.get_proof(2)
+assert tree.verify_proof(hashes[2], proof, tree.root), 'MERKLE PROOF FAIL'
+
+# Tampered hash should fail
+assert not tree.verify_proof(sha256(b'fake'), proof, tree.root), 'MERKLE TAMPER DETECTION FAIL'
+
+print('✓ Merkle tree OK')
+"
+```
+
+### Test 5: P2P Magic Bytes
+
+```bash
+python3 -c "
+from network.protocol import MAGIC
+
+assert MAGIC == b'\\x4f\\x46\\x43\\x21', f'MAGIC WRONG: {MAGIC.hex()}'
+assert len(MAGIC) == 4, 'MAGIC LENGTH WRONG'
+
+print('✓ Magic bytes OK: ' + MAGIC.hex())
+"
+```
+
+### Test 6: P2P Handshake (loopback self-test)
+
+```bash
+python3 -c "
+import socket, threading, json, time
+
+MAGIC = b'\\x4f\\x46\\x43\\x21'
+GENESIS = '0000d5d1702ee9723c2b769189a962f75f55c08a8ff572740f905c61bb11fc8f'
+
+def make_version():
+    return json.dumps({'type':'version','data':{
+        'protocol':1,'agent':'test','height':0,
+        'genesis_hash':GENESIS,'port':0,'timestamp':int(time.time()),'nonce':1
+    }}) + '\n'
+
+result = {'ok': False}
+
+def server_side(srv):
+    conn, addr = srv.accept()
+    # Receive magic
+    data = conn.recv(4)
+    assert data == MAGIC, f'Server: bad magic {data.hex()}'
+    # Send magic back
+    conn.sendall(MAGIC)
+    # Receive version
+    reader = conn.makefile('r')
+    line = reader.readline()
+    msg = json.loads(line)
+    assert msg['type'] == 'version', 'Server: expected version'
+    assert msg['data']['genesis_hash'] == GENESIS, 'Server: genesis mismatch'
+    # Send version
+    conn.sendall(make_version().encode())
+    # Verack exchange
+    conn.sendall((json.dumps({'type':'verack','data':{}}) + '\n').encode())
+    line = reader.readline()
+    msg = json.loads(line)
+    assert msg['type'] == 'verack', 'Server: expected verack'
+    result['ok'] = True
+    conn.close()
+
+# Start server
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', 0))
+port = srv.getsockname()[1]
+srv.listen(1)
+t = threading.Thread(target=server_side, args=(srv,), daemon=True)
+t.start()
+
+# Client side
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(('127.0.0.1', port))
+s.sendall(MAGIC)
+data = s.recv(4)
+assert data == MAGIC, f'Client: bad magic {data.hex()}'
+s.sendall(make_version().encode())
+reader = s.makefile('r')
+line = reader.readline()
+msg = json.loads(line)
+assert msg['data']['genesis_hash'] == GENESIS, 'Client: genesis mismatch'
+s.sendall((json.dumps({'type':'verack','data':{}}) + '\n').encode())
+line = reader.readline()
+msg = json.loads(line)
+assert msg['type'] == 'verack', 'Client: expected verack'
+
+t.join(timeout=5)
+assert result['ok'], 'Handshake did not complete'
+s.close()
+srv.close()
+
+print('✓ P2P handshake loopback OK')
+"
+```
+
+### Test 7: CLI Commands Exist
+
+```bash
+python3 ofc.py --help | grep -q "init" && echo "✓ init command exists" || echo "✗ init MISSING"
+python3 ofc.py --help | grep -q "start" && echo "✓ start command exists" || echo "✗ start MISSING"
+python3 ofc.py --help | grep -q "diagnose" && echo "✓ diagnose command exists" || echo "✗ diagnose MISSING"
+python3 ofc.py --help | grep -q "netcheck" && echo "✓ netcheck command exists" || echo "✗ netcheck MISSING"
+python3 ofc.py --help | grep -q "wallet" && echo "✓ wallet command exists" || echo "✗ wallet MISSING"
+python3 ofc.py --help | grep -q "send" && echo "✓ send command exists" || echo "✗ send MISSING"
+python3 ofc.py --help | grep -q "peers" && echo "✓ peers command exists" || echo "✗ peers MISSING"
+```
+
+### What To Do When Tests Fail
+
+```
+Test 1 fails → Genesis block code is wrong. Copy genesis_block() from this SKILL.md.
+Test 2 fails → INITIAL_REWARD or halving logic wrong. Must be 43920819223131 >> halvings.
+Test 3 fails → Ed25519 sign/verify broken. Check ed25519 package is installed.
+Test 4 fails → Merkle tree implementation bug. Check odd-leaf duplication and hash order.
+Test 5 fails → Magic constant wrong. Must be exactly b'\x4f\x46\x43\x21'.
+Test 6 fails → Handshake protocol bug. Most common: missing newline in JSON, wrong message
+              order, genesis_hash field missing from version message.
+Test 7 fails → CLI subcommand not registered. Check argparse subparsers setup.
+```
+
+**Do NOT tell the user the project is ready until all 7 tests pass.**
+If a test fails, fix the specific file and re-run only that test.
 
 ---
 
