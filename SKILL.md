@@ -937,6 +937,57 @@ python3 ofc.py --help | grep -q "send" && echo "✓ send command exists" || echo
 python3 ofc.py --help | grep -q "peers" && echo "✓ peers command exists" || echo "✗ peers MISSING"
 ```
 
+### Test 8: Sync-Friendliness (node responds to all request types)
+
+This test verifies the node is a good network citizen — it doesn't just broadcast,
+it actually responds when other nodes ask for data.
+
+```bash
+python3 -c "
+from network.protocol import MessageDispatcher
+
+# Check that all required handler methods exist
+dispatcher_cls = MessageDispatcher
+required_handlers = [
+    'on_get_block',     # Serve single block by hash
+    'on_get_blocks',    # Serve batch of blocks (IBD phase 2)
+    'on_get_headers',   # Serve headers (IBD phase 1)
+    'on_get_status',    # Report our chain tip
+    'on_get_peers',     # Share peer list
+    'on_ping',          # Respond with pong
+    'on_new_block',     # Accept and relay blocks
+    'on_new_tx',        # Accept and relay transactions
+    'on_blocks',        # Handle batch block response
+    'on_headers',       # Handle headers response
+]
+
+missing = []
+for h in required_handlers:
+    if not hasattr(dispatcher_cls, h) or not callable(getattr(dispatcher_cls, h)):
+        missing.append(h)
+
+if missing:
+    print(f'✗ SYNC FAIL: Missing handlers: {missing}')
+    print(f'  Without these, other nodes cannot sync from this node!')
+    exit(1)
+
+# Verify on_new_block includes block data in relay (not just hash)
+import inspect
+src = inspect.getsource(dispatcher_cls.on_new_block)
+if 'block' not in src or 'broadcast' not in src:
+    print('✗ SYNC FAIL: on_new_block does not relay full block data')
+    exit(1)
+
+# Verify on_get_blocks returns actual blocks (not empty)
+src = inspect.getsource(dispatcher_cls.on_get_blocks)
+if 'get_block_by_hash' not in src and 'get_block' not in src:
+    print('✗ SYNC FAIL: on_get_blocks does not look up blocks from chain')
+    exit(1)
+
+print('✓ Sync-friendliness OK: all 10 handlers present, relay includes full data')
+"
+```
+
 ### What To Do When Tests Fail
 
 ```
@@ -948,9 +999,12 @@ Test 5 fails → Magic constant wrong. Must be exactly b'\x4f\x46\x43\x21'.
 Test 6 fails → Handshake protocol bug. Most common: missing newline in JSON, wrong message
               order, genesis_hash field missing from version message.
 Test 7 fails → CLI subcommand not registered. Check argparse subparsers setup.
+Test 8 fails → Message handler missing. The node will broadcast but not respond to
+              requests — other nodes cannot sync. Must implement ALL handlers in the
+              dispatcher. See p2p_network.md "Message Dispatcher" section for full code.
 ```
 
-**Do NOT tell the user the project is ready until all 7 tests pass.**
+**Do NOT tell the user the project is ready until all 8 tests pass.**
 If a test fails, fix the specific file and re-run only that test.
 
 ---
