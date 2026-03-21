@@ -377,6 +377,513 @@ KEEPALIVE:
 
 ---
 
+## Message Dispatcher — Handling ALL Incoming Requests
+
+This is the **most critical section** for multi-node interoperability. Every node
+MUST respond to every request type. A node that only broadcasts but doesn't respond
+to requests is a bad citizen — other nodes cannot sync from it.
+
+### The Core Problem This Solves
+
+Without a proper dispatcher, nodes behave like this:
+- Node A mines a block → broadcasts `new_block` → OK
+- Node B joins later, asks Node A for historical blocks → **silence**
+- Node B can never sync because Node A ignores `get_blocks`
+
+Every node MUST be both a **client** (requesting data) AND a **server** (responding
+to requests). This is peer-to-peer, not client-server.
+
+### Complete Dispatcher Implementation
+
+```python
+class MessageDispatcher:
+    """Routes incoming messages to handler functions.
+    Every message type MUST have a handler. If a type is received
+    without a handler, log a warning (don't crash)."""
+
+    def __init__(self, node):
+        self.node = node
+        self.handlers = {
+            # Connection (handled separately in handshake)
+            'version':     None,  # Handled in handshake, not here
+            'verack':      None,  # Handled in handshake, not here
+            'reject':      self.on_reject,
+
+            # Block propagation
+            'new_block':   self.on_new_block,
+            'get_block':   self.on_get_block,     # ← MUST respond
+            'block':       self.on_block,
+
+            # Transactions
+            'new_tx':      self.on_new_tx,
+
+            # Chain sync — ALL of these MUST respond
+            'get_headers': self.on_get_headers,   # ← MUST respond
+            'headers':     self.on_headers,
+            'get_blocks':  self.on_get_blocks,    # ← MUST respond
+            'blocks':      self.on_blocks,
+
+            # Peer discovery
+            'get_peers':   self.on_get_peers,     # ← MUST respond
+            'peers':       self.on_peers,
+            'get_status':  self.on_get_status,    # ← MUST respond
+            'status':      self.on_status,
+
+            # Keepalive
+            'ping':        self.on_ping,          # ← MUST respond with pong
+            'pong':        self.on_pong,
+        }
+
+    def dispatch(self, peer, msg):
+        msg_type = msg.get('type', '')
+        handler = self.handlers.get(msg_type)
+        if handler is None:
+            log.warning(f"[MSG] Unknown message type: {msg_type} from {peer.addr}")
+            return
+        try:
+            handler(peer, msg.get('data', {}))
+        except Exception as e:
+            log.error(f"[MSG] Handler error for {msg_type}: {e}")
+            peer.score -= 5
+```
+
+### Block Serving Handlers (nodes MUST implement these)
+
+```python
+    # ─── RESPOND TO get_block: Return a single block by hash ───
+
+    def on_get_block(self, peer, data):
+        """Peer requests a specific block. We MUST respond."""
+        block_hash = bytes.fromhex(data.get('hash', ''))
+        block = self.node.chain.get_block_by_hash(block_hash)
+
+        if block:
+            peer.send('block', {'block': block.to_hex()})
+            log.debug(f"[SERVE] Sent block {data['hash'][:16]}... to {peer.addr}")
+        else:
+            # We don't have it — respond with empty so peer doesn't hang
+            peer.send('block', {'block': None, 'not_found': True})
+            log.debug(f"[SERVE] Block {data['hash'][:16]}... not found, sent not_found")
+
+    # ─── RESPOND TO get_blocks: Return multiple blocks by hash list ───
+
+    def on_get_blocks(self, peer, data):
+        """Peer requests a batch of blocks. We MUST respond with as many as we have.
+        This is the primary mechanism for chain sync (IBD phase 2)."""
+        hashes = data.get('hashes', [])
+
+        # Limit batch size to prevent memory abuse
+        MAX_BATCH = 50
+        if len(hashes) > MAX_BATCH:
+            hashes = hashes[:MAX_BATCH]
+            log.warning(f"[SERVE] Capped get_blocks to {MAX_BATCH} from {peer.addr}")
+
+        blocks = []
+        for h in hashes:
+            block = self.node.chain.get_block_by_hash(bytes.fromhex(h))
+            if block:
+                blocks.append(block.to_hex())
+            # If we don't have a block, skip it (don't include None)
+
+        peer.send('blocks', {
+            'blocks': blocks,
+            'requested': len(hashes),
+            'returned': len(blocks),
+        })
+        log.info(f"[SERVE] Sent {len(blocks)}/{len(hashes)} blocks to {peer.addr}")
+
+    # ─── RESPOND TO get_headers: Return headers from a height ───
+
+    def on_get_headers(self, peer, data):
+        """Peer requests headers for chain sync (IBD phase 1).
+        We MUST respond — this is how new nodes discover the chain."""
+        from_height = data.get('from_height', 0)
+        count = min(data.get('count', 500), 500)  # Cap at 500
+
+        headers = []
+        for h in range(from_height, from_height + count):
+            block = self.node.chain.get_block_by_height(h)
+            if block is None:
+                break  # We don't have blocks past this height
+            headers.append(block.header_hex())
+
+        peer.send('headers', {
+            'headers': headers,
+            'from_height': from_height,
+            'count': len(headers),
+        })
+        log.info(f"[SERVE] Sent {len(headers)} headers "
+                 f"(height {from_height}..{from_height + len(headers) - 1}) to {peer.addr}")
+
+    # ─── RESPOND TO get_status: Return our chain tip ───
+
+    def on_get_status(self, peer, data):
+        """Peer wants to know our chain state. Always respond."""
+        peer.send('status', {
+            'height': self.node.chain.get_height(),
+            'best_hash': self.node.chain.get_best_hash().hex(),
+            'genesis_hash': GENESIS_HASH,
+        })
+
+    # ─── RESPOND TO get_peers: Share our known peers ───
+
+    def on_get_peers(self, peer, data):
+        """Share our peer list (excluding the asking peer)."""
+        peer_list = []
+        for addr, p in self.node.peers.items():
+            if p != peer and p.port:
+                host, port_str = addr.rsplit(':', 1)
+                peer_list.append({'host': host, 'port': int(port_str)})
+        peer.send('peers', {'peers': peer_list[:50]})  # Cap at 50
+
+    # ─── RESPOND TO ping ───
+
+    def on_ping(self, peer, data):
+        """Always respond to ping with pong echoing the nonce."""
+        peer.send('pong', {'nonce': data.get('nonce', 0)})
+```
+
+### Block Propagation Handlers
+
+```python
+    # ─── RECEIVE new_block: Validate and relay ───
+
+    def on_new_block(self, peer, data):
+        """A peer announces a new block. Validate, store, and relay."""
+        block_hash = data.get('hash', '')
+
+        # Dedup: skip if we already have this block
+        if block_hash in self.node.seen_blocks:
+            return
+        self.node.seen_blocks.add(block_hash)
+
+        block_hex = data.get('block')
+        if not block_hex:
+            # Peer sent announcement without block data — request it
+            peer.send('get_block', {'hash': block_hash})
+            return
+
+        block = Block.from_hex(block_hex)
+        if self.node.chain.validate_and_add(block):
+            peer.score += 10
+            log.info(f"[BLOCK] Accepted block height={block.height} "
+                     f"hash={block_hash[:16]}... from {peer.addr}")
+
+            # *** RELAY TO ALL OTHER PEERS ***
+            # Include full block data so receivers don't need to request it
+            self.node.broadcast('new_block', {
+                'hash': block_hash,
+                'height': block.height,
+                'block': block_hex,    # ← Include full block, not just hash
+            }, exclude_peer=peer)
+        else:
+            peer.score -= 50
+            log.warning(f"[BLOCK] REJECTED block {block_hash[:16]}... from {peer.addr}")
+
+    # ─── RECEIVE block: Response to our get_block request ───
+
+    def on_block(self, peer, data):
+        """Response to a get_block we sent earlier."""
+        if data.get('not_found'):
+            return  # Peer doesn't have it, try another peer
+
+        block_hex = data.get('block')
+        if block_hex:
+            block = Block.from_hex(block_hex)
+            if self.node.chain.validate_and_add(block):
+                peer.score += 5
+
+    # ─── RECEIVE blocks: Batch response for IBD ───
+
+    def on_blocks(self, peer, data):
+        """Batch block response during IBD sync."""
+        blocks_hex = data.get('blocks', [])
+        requested = data.get('requested', len(blocks_hex))
+        returned = data.get('returned', len(blocks_hex))
+
+        log.info(f"[SYNC] Received {returned}/{requested} blocks from {peer.addr}")
+
+        accepted = 0
+        for bh in blocks_hex:
+            block = Block.from_hex(bh)
+            if self.node.chain.validate_and_add(block):
+                accepted += 1
+            else:
+                log.warning(f"[SYNC] Block validation failed during IBD, stopping batch")
+                peer.score -= 20
+                break
+
+        peer.score += accepted
+        log.info(f"[SYNC] Accepted {accepted}/{returned} blocks")
+
+    # ─── RECEIVE headers: Response for IBD phase 1 ───
+
+    def on_headers(self, peer, data):
+        """Headers batch during IBD. Validate and store for later block download."""
+        headers_hex = data.get('headers', [])
+        from_height = data.get('from_height', 0)
+
+        validated = 0
+        for i, h_hex in enumerate(headers_hex):
+            header = BlockHeader.from_hex(h_hex)
+            if self.node.chain.validate_header(header):
+                self.node.chain.store_header(header)
+                validated += 1
+            else:
+                log.warning(f"[SYNC] Invalid header at height {from_height + i}")
+                peer.score -= 20
+                break
+
+        log.info(f"[SYNC] Validated {validated}/{len(headers_hex)} headers "
+                 f"from height {from_height}")
+```
+
+### Transaction Handler
+
+```python
+    def on_new_tx(self, peer, data):
+        """Receive and relay a new transaction."""
+        tx_hex = data.get('tx', '')
+        tx_hash = hashlib.sha256(bytes.fromhex(tx_hex)).hexdigest()
+
+        if tx_hash in self.node.seen_txs:
+            return
+        self.node.seen_txs.add(tx_hash)
+
+        tx = Transaction.from_hex(tx_hex)
+        if self.node.mempool.add(tx):
+            peer.score += 1
+            self.node.broadcast('new_tx', data, exclude_peer=peer)
+        else:
+            peer.score -= 10
+```
+
+### Remaining Handlers
+
+```python
+    def on_reject(self, peer, data):
+        """Peer rejected something we sent."""
+        log.warning(f"[REJECT] From {peer.addr}: code={data.get('code')} "
+                    f"reason={data.get('reason')}")
+
+    def on_peers(self, peer, data):
+        """Received peer list — add unknown peers for future connection."""
+        for p in data.get('peers', []):
+            addr = f"{p['host']}:{p['port']}"
+            if addr not in self.node.peers and addr not in self.node.known_addrs:
+                self.node.known_addrs.add(addr)
+
+    def on_status(self, peer, data):
+        """Received peer's chain status — update our knowledge of their height."""
+        peer.peer_height = data.get('height', 0)
+        peer.best_hash = data.get('best_hash', '')
+
+    def on_pong(self, peer, data):
+        """Pong received — peer is alive. Record latency."""
+        peer.last_pong = time.time()
+```
+
+---
+
+## Improved Chain Sync (IBD) — Full Implementation
+
+The IBD (Initial Block Download) process MUST work as a proper client that
+sends requests AND the peer MUST respond using the handlers above.
+
+```python
+class ChainSync:
+    """Handles initial block download from peers."""
+
+    def __init__(self, node):
+        self.node = node
+        self.syncing = False
+
+    def start_sync(self):
+        """Called after handshake if peer has higher chain."""
+        if self.syncing:
+            return
+        self.syncing = True
+
+        try:
+            best_peer = self._find_best_peer()
+            if not best_peer:
+                log.info("[SYNC] No peers with higher chain, we're up to date")
+                return
+
+            local_height = self.node.chain.get_height()
+            peer_height = best_peer.peer_height
+
+            log.info(f"[SYNC] Starting IBD: local={local_height} "
+                     f"peer={peer_height} gap={peer_height - local_height} blocks")
+
+            # Phase 1: Download and validate headers
+            log.info("[SYNC] Phase 1: Downloading headers...")
+            height = local_height + 1
+            total_headers = 0
+            while height <= peer_height:
+                best_peer.send('get_headers', {
+                    'from_height': height,
+                    'count': 500,
+                })
+                resp = self._wait_for(best_peer, 'headers', timeout=30)
+                if resp is None:
+                    log.warning("[SYNC] Header download timed out, retrying with another peer")
+                    best_peer = self._find_next_peer(best_peer)
+                    if not best_peer:
+                        break
+                    continue
+
+                headers = resp.get('headers', [])
+                if not headers:
+                    break
+
+                total_headers += len(headers)
+                height += len(headers)
+                log.info(f"[SYNC] Headers: {total_headers} downloaded, up to height {height - 1}")
+
+            # Phase 2: Download full blocks in batches
+            log.info("[SYNC] Phase 2: Downloading full blocks...")
+            missing_hashes = self.node.chain.get_headers_without_blocks()
+            total_blocks = len(missing_hashes)
+            downloaded = 0
+
+            for i in range(0, len(missing_hashes), 50):  # Batches of 50
+                batch = missing_hashes[i:i+50]
+
+                # Try multiple peers for resilience
+                peer = self._find_peer_with_blocks(batch)
+                if not peer:
+                    peer = best_peer
+
+                peer.send('get_blocks', {'hashes': [h.hex() for h in batch]})
+                resp = self._wait_for(peer, 'blocks', timeout=60)
+
+                if resp is None:
+                    log.warning(f"[SYNC] Block batch timed out at offset {i}")
+                    continue
+
+                blocks_hex = resp.get('blocks', [])
+                returned = resp.get('returned', len(blocks_hex))
+                downloaded += returned
+                log.info(f"[SYNC] Blocks: {downloaded}/{total_blocks} "
+                         f"({100*downloaded//max(total_blocks,1)}%)")
+
+            log.info(f"[SYNC] IBD complete: synced to height {self.node.chain.get_height()}")
+
+        finally:
+            self.syncing = False
+
+    def _find_best_peer(self):
+        local_h = self.node.chain.get_height()
+        peers = [(p, p.peer_height) for p in self.node.peers.values()
+                 if p.peer_height > local_h]
+        if not peers:
+            return None
+        return max(peers, key=lambda x: x[1])[0]
+
+    def _find_next_peer(self, exclude):
+        """Find another peer for failover."""
+        local_h = self.node.chain.get_height()
+        for p in self.node.peers.values():
+            if p != exclude and p.peer_height > local_h:
+                return p
+        return None
+
+    def _find_peer_with_blocks(self, hashes):
+        """Find any peer that likely has these blocks (by height)."""
+        # Any peer with height >= our request height should have them
+        return self._find_best_peer()
+
+    def _wait_for(self, peer, expected_type, timeout=30):
+        """Wait for a specific message type from a peer.
+        Other message types received during the wait are dispatched normally."""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = peer.recv_with_timeout(timeout=max(1, deadline - time.time()))
+            if msg is None:
+                return None
+            if msg.get('type') == expected_type:
+                return msg.get('data', {})
+            # Not what we're waiting for — dispatch it normally
+            self.node.dispatcher.dispatch(peer, msg)
+        return None
+```
+
+---
+
+## New Block Relay — Include Full Data
+
+When relaying a new block, ALWAYS include the full block data, not just the
+hash. This prevents a cascade of `get_block` requests:
+
+```
+BAD (announcement only — forces N extra round trips):
+  Node A mines block
+  A → B: {"type":"new_block","data":{"hash":"abc..."}}
+  B → A: {"type":"get_block","data":{"hash":"abc..."}}     ← extra request
+  A → B: {"type":"block","data":{"block":"<hex>"}}          ← extra response
+  B → C: {"type":"new_block","data":{"hash":"abc..."}}
+  C → B: {"type":"get_block","data":{"hash":"abc..."}}     ← extra request
+  ... multiplied by every node in the network
+
+GOOD (full relay — zero extra round trips):
+  Node A mines block
+  A → B: {"type":"new_block","data":{"hash":"abc...","height":42,"block":"<hex>"}}
+  B validates, then:
+  B → C: {"type":"new_block","data":{"hash":"abc...","height":42,"block":"<hex>"}}
+  C validates, then:
+  C → D: ... (propagation complete in one hop per node)
+```
+
+Implementation:
+
+```python
+def broadcast_new_block(self, block):
+    """Broadcast a newly mined or received block WITH full data."""
+    block_hex = block.to_hex()
+    msg_data = {
+        'hash': block.hash_hex(),
+        'height': block.height,
+        'block': block_hex,      # ← ALWAYS include full block
+    }
+    self.broadcast('new_block', msg_data)
+    log.info(f"[RELAY] Broadcasting block height={block.height} "
+             f"hash={block.hash_hex()[:16]}... size={len(block_hex)//2}B "
+             f"to {len(self.peers)} peers")
+```
+
+---
+
+## Sync-Friendliness Checklist
+
+Every generated node MUST satisfy ALL of these. Missing any one breaks
+multi-node operation:
+
+```
+SERVING (responding to peer requests):
+  [x] on_get_block    → Return single block by hash (or not_found)
+  [x] on_get_blocks   → Return batch of blocks by hash list (up to 50)
+  [x] on_get_headers  → Return headers from a height (up to 500)
+  [x] on_get_status   → Return our height + best hash + genesis hash
+  [x] on_get_peers    → Return our known peer list
+  [x] on_ping         → Always reply with pong (echo nonce)
+
+RELAYING (forwarding to other peers):
+  [x] new_block       → Include FULL block data, not just hash
+  [x] new_tx          → Include full transaction data
+
+SYNCING (requesting from peers):
+  [x] IBD Phase 1     → Request headers in batches of 500
+  [x] IBD Phase 2     → Request blocks in batches of 50
+  [x] Failover        → If one peer times out, try another
+  [x] Progress log    → Show sync progress: "Blocks: 150/1000 (15%)"
+```
+
+**If any [x] above is missing from the generated code, it is a bug. Fix it.**
+
+---
+
 ## Connection Logging
 
 Every connection event should be logged with enough detail to diagnose problems.
